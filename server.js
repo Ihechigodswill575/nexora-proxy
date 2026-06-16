@@ -20,12 +20,22 @@ const MIRROR_HOSTS = [
   "netnaija.video"
 ];
 
+// ── FIX 1: Content-Type REMOVED from DEFAULT_HEADERS ──────────────────────────
+// The original code had "Content-Type": "application/json" here.
+// This header was being forwarded to video CDNs when proxying segments,
+// which corrupted the request and caused CDNs to reject or misbehave —
+// killing the audio track entirely. Content-Type belongs on POST bodies only.
 const DEFAULT_HEADERS = {
-  "Accept":          "application/json",
+  "Accept":          "application/json, text/plain, */*",
   "Accept-Language": "en-US,en;q=0.5",
   "X-Client-Info":   '{"timezone":"Africa/Nairobi"}',
   "User-Agent":      "moviebox-js-sdk/preview",
-  "Content-Type":    "application/json"
+};
+
+// Separate headers for API calls that actually send JSON bodies
+const JSON_HEADERS = {
+  ...DEFAULT_HEADERS,
+  "Content-Type": "application/json",
 };
 
 const APP_INFO_PATH = "/wefeed-h5-bff/app/get-latest-app-pkgs";
@@ -33,13 +43,15 @@ const STREAM_PATH   = "/wefeed-h5-bff/web/subject/play";
 const DOWNLOAD_PATH = "/wefeed-h5-bff/web/subject/download";
 const SEARCH_PATH   = "/wefeed-h5-bff/web/subject/search";
 
-// ── SESSION CLASS ──────────────────────────────
+// ── SESSION CLASS ──────────────────────────────────────────────────────────────
 class Session {
   constructor(host) {
     this.host        = host;
     this.baseUrl     = `https://${host}`;
     this.cookies     = new Map();
     this.initialized = false;
+    // FIX 2: Track the init promise so parallel requests don't race
+    this._initPromise = null;
   }
 
   storeCookies(headers) {
@@ -61,20 +73,26 @@ class Session {
     return Array.from(this.cookies.entries()).map(([k,v]) => `${k}=${v}`).join("; ");
   }
 
-  async init() {
-    if (this.initialized) return;
-    try {
-      const res = await axios.get(`${this.baseUrl}${APP_INFO_PATH}?app_name=moviebox`, {
-        headers: { ...DEFAULT_HEADERS, Cookie: this.cookieHeader() },
-        timeout: 8000, validateStatus: () => true
-      });
+  // FIX 2: init() now returns the same promise for concurrent callers
+  // so the first request doesn't race against pre-warm — both await the same init.
+  init() {
+    if (this.initialized) return Promise.resolve();
+    if (this._initPromise) return this._initPromise;
+    this._initPromise = axios.get(`${this.baseUrl}${APP_INFO_PATH}?app_name=moviebox`, {
+      headers: { ...JSON_HEADERS, Cookie: this.cookieHeader() },
+      timeout: 8000,
+      validateStatus: () => true
+    }).then(res => {
       this.storeCookies(res.headers);
       this.initialized = true;
       console.log(`[Session:${this.host}] init OK, cookies:${this.cookies.size}`);
-    } catch(e) {
-      this.initialized = true;
+    }).catch(e => {
+      this.initialized = true; // Mark done even on failure so we don't loop
       console.warn(`[Session:${this.host}] init failed:`, e.message);
-    }
+    }).finally(() => {
+      this._initPromise = null;
+    });
+    return this._initPromise;
   }
 
   async get(path, params = {}, extraHeaders = {}) {
@@ -82,8 +100,10 @@ class Session {
     const url = new URL(`${this.baseUrl}${path}`);
     Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, String(v)));
     const res = await axios.get(url.toString(), {
-      headers: { ...DEFAULT_HEADERS, ...extraHeaders, Cookie: this.cookieHeader() },
-      timeout: 10000, validateStatus: () => true
+      // FIX 1: Use JSON_HEADERS for API calls (has Content-Type: application/json)
+      headers: { ...JSON_HEADERS, ...extraHeaders, Cookie: this.cookieHeader() },
+      timeout: 10000,
+      validateStatus: () => true
     });
     this.storeCookies(res.headers);
     if (res.status === 403 || res.status === 451) throw new Error(`Blocked:${res.status}`);
@@ -99,8 +119,10 @@ class Session {
   async post(path, body = {}) {
     await this.init();
     const res = await axios.post(`${this.baseUrl}${path}`, body, {
-      headers: { ...DEFAULT_HEADERS, Cookie: this.cookieHeader() },
-      timeout: 10000, validateStatus: () => true
+      // FIX 1: Use JSON_HEADERS for POST (has Content-Type: application/json)
+      headers: { ...JSON_HEADERS, Cookie: this.cookieHeader() },
+      timeout: 10000,
+      validateStatus: () => true
     });
     this.storeCookies(res.headers);
     if (!String(res.status).startsWith("2")) throw new Error(`HTTP:${res.status}`);
@@ -131,9 +153,9 @@ async function withMirror(fn) {
   throw new Error("All mirrors failed");
 }
 
-// ── ROUTES ─────────────────────────────────────
+// ── ROUTES ────────────────────────────────────────────────────────────────────
 
-app.get("/", (req, res) => res.json({ status:"ok", version:"2.0" }));
+app.get("/", (req, res) => res.json({ status:"ok", version:"2.1" }));
 
 // SEARCH
 app.get("/search", async (req, res) => {
@@ -202,7 +224,7 @@ app.get("/find", async (req, res) => {
   } catch(e) { res.status(502).json({ error:e.message }); }
 });
 
-// STREAM — with Referer + cookies
+// STREAM
 app.get("/stream", async (req, res) => {
   const { id, detailPath, season=0, episode=0 } = req.query;
   if (!id) return res.status(400).json({ error:"Missing id" });
@@ -243,9 +265,54 @@ app.get("/download", async (req, res) => {
   } catch(e) { res.status(502).json({ error:e.message }); }
 });
 
-// ── VIDEO PROXY — FIXED with proper Range support ─────────
-// This is what was causing the audio issue — Range headers
-// are essential for video streaming (seeking, audio sync)
+// ── FIX 3: M3U8 SEGMENT REWRITER ──────────────────────────────────────────────
+// When an HLS .m3u8 manifest is proxied, the segment URLs inside it are absolute
+// CDN URLs (e.g. https://cdn.example.com/seg001.ts). The browser/HLS.js then
+// tries to fetch those directly — which fails CORS and loses the audio track.
+// This function rewrites every segment URL in the manifest to go through /proxy.
+function rewriteM3U8(body, proxyBase, originalUrl) {
+  const base = originalUrl.substring(0, originalUrl.lastIndexOf("/") + 1);
+
+  return body.split("\n").map(line => {
+    const trimmed = line.trim();
+    // Skip comments and empty lines
+    if (!trimmed || trimmed.startsWith("#")) return line;
+
+    let absoluteUrl;
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+      absoluteUrl = trimmed;
+    } else if (trimmed.startsWith("/")) {
+      // Root-relative URL
+      const u = new URL(originalUrl);
+      absoluteUrl = `${u.origin}${trimmed}`;
+    } else {
+      // Relative URL — resolve against the manifest's base path
+      absoluteUrl = base + trimmed;
+    }
+
+    return `${proxyBase}/proxy?url=${encodeURIComponent(absoluteUrl)}`;
+  }).join("\n");
+}
+
+// Also rewrite URI= values inside #EXT-X-KEY and #EXT-X-MAP tags
+function rewriteM3U8Tags(body, proxyBase, originalUrl) {
+  const base = originalUrl.substring(0, originalUrl.lastIndexOf("/") + 1);
+  const u    = new URL(originalUrl);
+
+  return body.replace(/URI="([^"]+)"/g, (match, uri) => {
+    let abs;
+    if (uri.startsWith("http://") || uri.startsWith("https://")) {
+      abs = uri;
+    } else if (uri.startsWith("/")) {
+      abs = `${u.origin}${uri}`;
+    } else {
+      abs = base + uri;
+    }
+    return `URI="${proxyBase}/proxy?url=${encodeURIComponent(abs)}"`;
+  });
+}
+
+// ── VIDEO / M3U8 PROXY ────────────────────────────────────────────────────────
 app.get("/proxy", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error:"Missing url" });
@@ -253,38 +320,61 @@ app.get("/proxy", async (req, res) => {
   const targetUrl = decodeURIComponent(url);
   const session   = sessions[currentIdx] || sessions[0];
 
-  // Forward all range/cache headers from client
+  // FIX 1: Do NOT include Content-Type when proxying video/media resources
+  // Only forward actual request metadata headers
   const forwardHeaders = {
-    ...DEFAULT_HEADERS,
+    ...DEFAULT_HEADERS,          // No Content-Type in here anymore
     Cookie:   session.cookieHeader(),
     Referer:  session.baseUrl,
     Origin:   session.baseUrl,
   };
 
-  // ← KEY FIX: forward Range header for video seeking + audio sync
-  if (req.headers.range)              forwardHeaders["Range"]              = req.headers.range;
-  if (req.headers["accept-encoding"]) forwardHeaders["Accept-Encoding"]   = req.headers["accept-encoding"];
-  if (req.headers["if-range"])        forwardHeaders["If-Range"]          = req.headers["if-range"];
+  // Forward Range header — essential for video seeking and audio segment sync
+  if (req.headers["range"])           forwardHeaders["Range"]           = req.headers["range"];
+  if (req.headers["accept-encoding"]) forwardHeaders["Accept-Encoding"] = req.headers["accept-encoding"];
+  if (req.headers["if-range"])        forwardHeaders["If-Range"]        = req.headers["if-range"];
 
   try {
     const upstream = await axios({
       method:       "GET",
       url:          targetUrl,
       headers:      forwardHeaders,
-      responseType: "stream",
+      responseType: "arraybuffer",   // Use arraybuffer so we can inspect/rewrite m3u8 text
       timeout:      60000,
-      // Don't decompress — pass through as-is
       decompress:   false,
-      // Follow redirects
       maxRedirects: 5,
       httpAgent:    new http.Agent({ keepAlive: true }),
-      httpsAgent:   new https.Agent({ keepAlive: true })
+      httpsAgent:   new https.Agent({ keepAlive: true }),
+      validateStatus: () => true,
     });
 
-    // ← KEY: forward 206 Partial Content status (needed for audio)
+    const contentType = (upstream.headers["content-type"] || "").toLowerCase();
+    const isM3U8 = (
+      contentType.includes("mpegurl") ||
+      contentType.includes("x-mpegurl") ||
+      targetUrl.includes(".m3u8")
+    );
+
+    // ── FIX 3: If this is an m3u8 manifest, rewrite segment URLs ──
+    if (isM3U8 && upstream.status >= 200 && upstream.status < 300) {
+      let text = Buffer.from(upstream.data).toString("utf8");
+      const proxyBase = `${req.protocol}://${req.get("host")}`;
+
+      text = rewriteM3U8(text, proxyBase, targetUrl);
+      text = rewriteM3U8Tags(text, proxyBase, targetUrl);
+
+      res.status(200);
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Access-Control-Allow-Origin",   "*");
+      res.setHeader("Access-Control-Allow-Headers",  "*");
+      res.setHeader("Access-Control-Expose-Headers", "Content-Length, Accept-Ranges");
+      res.setHeader("Cache-Control", "no-cache");
+      return res.send(text);
+    }
+
+    // ── Regular media pass-through (video segments, mp4, etc.) ──
     res.status(upstream.status);
 
-    // Forward ALL media headers
     const passHeaders = [
       "content-type", "content-length", "content-range",
       "accept-ranges", "cache-control", "etag",
@@ -294,18 +384,11 @@ app.get("/proxy", async (req, res) => {
       if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]);
     });
 
-    // CORS
-    res.setHeader("Access-Control-Allow-Origin",  "*");
-    res.setHeader("Access-Control-Allow-Headers", "*");
-    res.setHeader("Access-Control-Expose-Headers","Content-Range, Content-Length, Accept-Ranges");
+    res.setHeader("Access-Control-Allow-Origin",   "*");
+    res.setHeader("Access-Control-Allow-Headers",  "*");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
 
-    // Pipe stream
-    upstream.data.pipe(res);
-
-    upstream.data.on("error", err => {
-      console.error("[proxy stream error]", err.message);
-      if (!res.headersSent) res.status(502).end();
-    });
+    res.send(Buffer.from(upstream.data));
 
   } catch(e) {
     console.error("[/proxy]", e.message);
@@ -322,7 +405,7 @@ app.options("*", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Nexora Proxy v2 on port ${PORT}`);
-  // Pre-warm all sessions
-  sessions.forEach(s => s.init().catch(()=>{}));
+  console.log(`✅ Nexora Proxy v2.1 on port ${PORT}`);
+  // Pre-warm sessions — stagger them so they don't all hammer at once
+  sessions.forEach((s, i) => setTimeout(() => s.init().catch(()=>{}), i * 300));
 });
